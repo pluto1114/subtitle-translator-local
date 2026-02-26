@@ -163,7 +163,7 @@ class SubtitleTranslatorApp(ctk.CTk):
 
         # Check Ollama connection first
         if not self.api_client.check_connection():
-            messagebox.showerror("连接错误", f"无法连接到 Ollama 服务。\n请确保 Ollama 已在本地启动，并且 API 地址配置正确。\n当前地址: {self.config['ollama_api_url']}")
+            messagebox.showerror("Connection Error", f"Unable to connect to Ollama service.\nPlease ensure Ollama is running locally and the API address is configured correctly.\nCurrent address: {self.config['ollama_api_url']}")
             return
             
         self.is_translating = True
