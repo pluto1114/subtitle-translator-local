@@ -165,12 +165,24 @@ class SubtitleTranslatorApp(ctk.CTk):
         if not self.api_client.check_connection():
             messagebox.showerror("Connection Error", f"Unable to connect to Ollama service.\nPlease ensure Ollama is running locally and the API address is configured correctly.\nCurrent address: {self.config['ollama_api_url']}")
             return
-            
+        
         self.is_translating = True
-        self.btn_start.configure(state="disabled", text="Translating...")
+        self.btn_start.configure(state="disabled", text="Loading Model...")
         self.btn_select_files.configure(state="disabled")
         self.btn_select_output.configure(state="disabled")
         self.progressbar.set(0)
+        
+        model = self.model_name.get()
+        self.log(f"Warming up model '{model}'...")
+        
+        if not self.api_client.warm_up_model(model, self.log):
+            self.is_translating = False
+            self.reset_ui()
+            messagebox.showerror("Model Error", f"Failed to load model '{model}'.\nPlease check if the model name is correct and Ollama has enough resources.")
+            return
+        
+        self.log(f"Model '{model}' is ready. Starting translation...")
+        self.btn_start.configure(text="Translating...")
         
         threading.Thread(target=self.translate_files, daemon=True).start()
 

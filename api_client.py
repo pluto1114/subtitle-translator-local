@@ -23,6 +23,53 @@ class OllamaClient:
         except:
             return False
 
+    def warm_up_model(self, model, progress_callback=None):
+        import time
+        max_attempts = 10
+        attempt = 0
+        
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                if progress_callback:
+                    progress_callback(f"Loading model '{model}' (attempt {attempt}/{max_attempts})...")
+                
+                if "/v1/chat/completions" in self.api_url:
+                    payload = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "stream": False,
+                        "temperature": 0.1
+                    }
+                else:
+                    payload = {
+                        "model": model,
+                        "prompt": "Hi",
+                        "stream": False,
+                        "options": {"temperature": 0.1}
+                    }
+                
+                headers = {"Content-Type": "application/json"}
+                response = requests.post(self.api_url, json=payload, headers=headers, timeout=600)
+                response.raise_for_status()
+                
+                if progress_callback:
+                    progress_callback(f"Model '{model}' loaded successfully!")
+                return True
+                
+            except requests.exceptions.Timeout:
+                if progress_callback:
+                    progress_callback(f"Model still loading... waiting (attempt {attempt}/{max_attempts})")
+                time.sleep(5)
+                continue
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"Error loading model: {str(e)}")
+                time.sleep(3)
+                continue
+        
+        return False
+
     def translate_batch(self, text, target_lang, model, count):
         separator = "---BLOCK_SEP---"
         system_prompt = (
