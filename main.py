@@ -32,6 +32,8 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.output_directory = ctk.StringVar(value=self.config["output_directory"])
         self.use_original_filename = ctk.BooleanVar(value=False)
         self.is_translating = False
+        self.loading_animation_running = False
+        self.loading_animation_text = ""
         
         self.create_widgets()
 
@@ -93,8 +95,11 @@ class SubtitleTranslatorApp(ctk.CTk):
 
         # Progress Bar
         self.progressbar = ctk.CTkProgressBar(self.frame_controls)
-        self.progressbar.grid(row=7, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
+        self.progressbar.grid(row=7, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
         self.progressbar.set(0)
+        
+        self.label_progress_percent = ctk.CTkLabel(self.frame_controls, text="0%", width=60)
+        self.label_progress_percent.grid(row=7, column=2, padx=10, pady=10, sticky="e")
 
         # Log Area
         self.textbox_log = ctk.CTkTextbox(self, width=800, height=250)
@@ -134,7 +139,8 @@ class SubtitleTranslatorApp(ctk.CTk):
             "max_workers": self.config.get("max_workers", 3),
             "ollama_api_url": self.config.get("ollama_api_url", "http://localhost:11434/api/generate"),
             "timeout": self.config.get("timeout", 300),
-            "temperature": self.config.get("temperature", 0.1)
+            "temperature": self.config.get("temperature", 0.1),
+            "num_gpu": self.config.get("num_gpu", 0)
         }
         self.config_manager.save(current_config)
         self.config = current_config # Update in-memory config
@@ -148,43 +154,91 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.textbox_log.see("end")
         self.textbox_log.configure(state="disabled")
 
+    def start_loading_animation(self, base_text):
+        self.loading_animation_running = True
+        self.loading_animation_text = base_text
+        self._animate_loading()
+
+    def stop_loading_animation(self):
+        self.loading_animation_running = False
+
+    def _animate_loading(self):
+        if not self.loading_animation_running:
+            return
+        current_text = self.btn_start.cget("text")
+        if "..." in current_text:
+            new_text = current_text.replace("...", ".")
+        elif current_text.endswith("."):
+            dots = current_text.count(".") - current_text.rfind(".") + 1
+            if dots >= 3:
+                new_text = self.loading_animation_text + "..."
+            else:
+                new_text = current_text + "."
+        else:
+            new_text = self.loading_animation_text + "..."
+        self.btn_start.configure(text=new_text)
+        self.after(500, self._animate_loading)
+
     def start_translation_thread(self):
         if self.is_translating:
             return
         
         self.save_current_config()
         
-        # Init API Client
         self.api_client = OllamaClient(
             self.config["ollama_api_url"], 
             self.config["timeout"],
-            self.config["temperature"]
+            self.config["temperature"],
+            self.config.get("num_gpu", 0)
         )
 
-        # Check Ollama connection first
-        if not self.api_client.check_connection():
-            messagebox.showerror("Connection Error", f"Unable to connect to Ollama service.\nPlease ensure Ollama is running locally and the API address is configured correctly.\nCurrent address: {self.config['ollama_api_url']}")
-            return
-        
         self.is_translating = True
-        self.btn_start.configure(state="disabled", text="Loading Model...")
+        self.btn_start.configure(state="disabled", text="Checking Connection...")
         self.btn_select_files.configure(state="disabled")
         self.btn_select_output.configure(state="disabled")
         self.progressbar.set(0)
+        self.label_progress_percent.configure(text="0%")
         
+        threading.Thread(target=self._initialize_and_translate, daemon=True).start()
+
+    def _initialize_and_translate(self):
         model = self.model_name.get()
+        
+        self.start_loading_animation("Checking Ollama")
+        self.log("Checking Ollama connection...")
+        
+        if not self.api_client.check_connection():
+            self.log("Ollama service not running. Attempting to start...")
+            self.start_loading_animation("Starting Ollama")
+            
+            if not self.api_client.start_ollama_service(self.log):
+                self.stop_loading_animation()
+                self.is_translating = False
+                self.after(0, self.reset_ui)
+                self.after(0, lambda: messagebox.showerror("Service Error", 
+                    "Failed to start Ollama service.\n\n"
+                    "Please ensure Ollama is installed and available in your PATH.\n"
+                    "You can download it from: https://ollama.ai"))
+                return
+        
+        self.start_loading_animation("Loading Model")
         self.log(f"Warming up model '{model}'...")
         
         if not self.api_client.warm_up_model(model, self.log):
+            self.stop_loading_animation()
             self.is_translating = False
-            self.reset_ui()
-            messagebox.showerror("Model Error", f"Failed to load model '{model}'.\nPlease check if the model name is correct and Ollama has enough resources.")
+            self.after(0, self.reset_ui)
+            self.after(0, lambda: messagebox.showerror("Model Error", 
+                f"Failed to load model '{model}'.\n\n"
+                "Please check if the model name is correct and Ollama has enough resources.\n"
+                "You can pull a model using: ollama pull <model_name>"))
             return
         
+        self.stop_loading_animation()
         self.log(f"Model '{model}' is ready. Starting translation...")
-        self.btn_start.configure(text="Translating...")
+        self.after(0, lambda: self.btn_start.configure(text="Translating..."))
         
-        threading.Thread(target=self.translate_files, daemon=True).start()
+        self.translate_files()
 
     def translate_files(self):
         target_lang = self.selected_target_language.get()
@@ -213,22 +267,26 @@ class SubtitleTranslatorApp(ctk.CTk):
             self.after(0, self.reset_ui)
 
     def reset_ui(self):
+        self.stop_loading_animation()
         self.btn_start.configure(state="normal", text="Start Translation")
         self.btn_select_files.configure(state="normal")
         self.btn_select_output.configure(state="normal")
         self.progressbar.set(1.0)
+        self.label_progress_percent.configure(text="100%")
         self.log("All tasks finished.")
-        # Play notification sound
         try:
             winsound.MessageBeep()
         except Exception:
             pass
 
-    def update_progress(self, current, total):
+    def update_progress(self, current, total, file_name=None):
         if total > 0:
             progress = current / total
-            self.progressbar.set(progress)
-            self.update_idletasks()
+            percent = int(progress * 100)
+            self.after(0, lambda: self.progressbar.set(progress))
+            self.after(0, lambda: self.label_progress_percent.configure(text=f"{percent}%"))
+            if file_name:
+                self.log(f"  [{file_name}] Progress: {current}/{total} ({percent}%)")
 
     def translate_single_file(self, file_path, target_lang, model, output_dir, use_original_name):
         self.log(f"Starting translation for: {os.path.basename(file_path)}")
@@ -240,11 +298,12 @@ class SubtitleTranslatorApp(ctk.CTk):
             self.log(f"Warning: No valid SRT blocks found in {os.path.basename(file_path)}.")
             return
 
-        batch_size = self.config.get("batch_size", 30)
+        batch_size = self.config.get("batch_size", 20)
         valid_indices = [i for i, b in enumerate(parsed_blocks) if b.get("is_valid", True)]
         
-        # Process in batches using ThreadPoolExecutor for concurrent API calls within a single file
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.get("max_workers", 3)) as executor:
+        max_workers = self.config.get("max_workers", 3)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_batch = {}
             
             for i in range(0, len(valid_indices), batch_size):
@@ -255,8 +314,9 @@ class SubtitleTranslatorApp(ctk.CTk):
                 input_text = ""
                 separator = "---BLOCK_SEP---"
                 for i, b in enumerate(batch_blocks):
-                    # Clean up text for prompt: replace newlines within a block with spaces to keep it as one line per block
                     clean_text = b['text'].strip()
+                    if len(clean_text) > 30:
+                        clean_text = clean_text[:30]
                     input_text += f"{clean_text}"
                     if i < len(batch_blocks) - 1:
                         input_text += f"\n{separator}\n"
@@ -272,11 +332,9 @@ class SubtitleTranslatorApp(ctk.CTk):
                 i, batch_blocks = future_to_batch[future]
                 try:
                     future.result()
-                    # Update progress
                     processed_so_far += len(batch_blocks)
-                    self.update_progress(processed_so_far, total_batches)
-                    
-                    self.log(f"  [{os.path.basename(file_path)}] Processed batch starting at index {batch_blocks[0]['index']}")
+                    file_name = os.path.basename(file_path)
+                    self.update_progress(processed_so_far, total_batches, file_name)
                 except Exception as e:
                     self.log(f"Error processing batch in {os.path.basename(file_path)}: {e}")
 
@@ -300,28 +358,92 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.log(f"Saved to: {new_file_path}")
 
     def process_batch(self, input_text, target_lang, model, batch_blocks):
+        batch_start_idx = batch_blocks[0]['index'] if batch_blocks else "?"
+        self.log(f"  Translating batch starting at index {batch_start_idx} ({len(batch_blocks)} blocks)...")
+        
         try:
-            # Call API with batch
             translated_batch_text = self.api_client.translate_batch(input_text, target_lang, model, len(batch_blocks))
             
-            # Split by separator instead of lines
-            separator_pattern = r"---BLOCK_SEP---"
-            parts = re.split(separator_pattern, translated_batch_text)
-            # Filter out empty strings that might appear at start/end
-            parts = [p.strip() for p in parts if p.strip()]
+            preview_len = 500
+            preview = translated_batch_text[:preview_len] + "..." if len(translated_batch_text) > preview_len else translated_batch_text
+            # self.log(f"API response ({len(translated_batch_text)} chars): {preview.replace(chr(10), ' | ')}")
             
-            # Assign translations based on order
+            parts = self._parse_batch_response(translated_batch_text, len(batch_blocks))
+            
+            self.log(f"Received {len(parts)} parts from API for {len(batch_blocks)} blocks. translated_batch_text: {len(translated_batch_text)}")
+            
             for i, b in enumerate(batch_blocks):
-                if i < len(parts):
+                if i < len(parts) and parts[i]:
                     b['translated_text'] = parts[i]
                 else:
-                    # Fallback if counts mismatch
-                    self.log(f"Batch count mismatch. Fallback to single for block {b['index']}")
-                    b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
+                    self.log(f"Batch count mismatch or empty part. Fallback to single for block {b['index']}")
+                    self.log(f"parts: {parts}, translated_batch_text: {translated_batch_text}, input_text: {input_text}")
+                    try:
+                        b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
+                    except Exception as single_e:
+                        self.log(f"Single translation also failed for block {b['index']}: {single_e}")
+                        b['translated_text'] = b['text']
+                        
         except Exception as e:
             self.log(f"Batch translation failed: {e}. Falling back to single translation.")
             for b in batch_blocks:
-                b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
+                try:
+                    b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
+                except Exception as single_e:
+                    self.log(f"Single translation failed for block {b['index']}: {single_e}")
+                    b['translated_text'] = b['text']
+    
+    def _parse_batch_response(self, response_text, expected_count):
+        parts = []
+        
+        pattern = r'^\[(\d+)\]\s*'
+        lines = response_text.split('\n')
+        
+        current_num = None
+        current_text_lines = []
+        
+        for line in lines:
+            match = re.match(pattern, line)
+            if match:
+                if current_num is not None:
+                    parts.append('\n'.join(current_text_lines).strip())
+                
+                current_num = int(match.group(1))
+                current_text_lines = [line[match.end():]]
+            elif current_num is not None:
+                current_text_lines.append(line)
+        
+        if current_num is not None:
+            parts.append('\n'.join(current_text_lines).strip())
+        
+        if len(parts) == expected_count:
+            return parts
+        
+        pattern2 = r'\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]|$)'
+        matches = re.findall(pattern2, response_text, re.DOTALL)
+        if matches:
+            translation_dict = {int(num): text.strip() for num, text in matches}
+            parts = []
+            for i in range(1, expected_count + 1):
+                parts.append(translation_dict.get(i, ""))
+            if len([p for p in parts if p]) > 0:
+                return parts
+        
+        separator_pattern = r"---BLOCK_SEP---"
+        if separator_pattern in response_text:
+            parts = re.split(separator_pattern, response_text)
+            parts = [p.strip() for p in parts if p.strip()]
+            if len(parts) == expected_count:
+                return parts
+        
+        lines_non_empty = [l.strip() for l in response_text.split('\n') if l.strip()]
+        if len(lines_non_empty) == expected_count:
+            return lines_non_empty
+        
+        if len(lines_non_empty) >= expected_count:
+            return lines_non_empty[:expected_count]
+        
+        return parts
 
 if __name__ == "__main__":
     app = SubtitleTranslatorApp()

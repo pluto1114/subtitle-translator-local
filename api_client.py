@@ -1,12 +1,37 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 import re
+import subprocess
+import time
+import platform
+import threading
 
 class OllamaClient:
-    def __init__(self, api_url, timeout=300, temperature=0.1):
+    def __init__(self, api_url, timeout=300, temperature=0.1, num_gpu=0):
         self.api_url = api_url
         self.timeout = timeout
         self.temperature = temperature
+        self.num_gpu = num_gpu
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        )
+        
+        self.session = requests.Session()
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        self._last_request_time = 0
 
     def check_connection(self):
         try:
@@ -23,8 +48,50 @@ class OllamaClient:
         except:
             return False
 
+    def start_ollama_service(self, progress_callback=None):
+        if progress_callback:
+            progress_callback("Starting Ollama service...")
+        
+        try:
+            if platform.system() == "Windows":
+                subprocess.Popen(
+                    ["ollama", "serve"],
+                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+            
+            max_wait = 30
+            for i in range(max_wait):
+                time.sleep(1)
+                if progress_callback:
+                    progress_callback(f"Waiting for Ollama to start... ({i+1}/{max_wait}s)")
+                if self.check_connection():
+                    if progress_callback:
+                        progress_callback("Ollama service started successfully!")
+                    return True
+            
+            if progress_callback:
+                progress_callback("Failed to start Ollama service within timeout.")
+            return False
+            
+        except FileNotFoundError:
+            if progress_callback:
+                progress_callback("Error: 'ollama' command not found. Please install Ollama first.")
+            return False
+        except Exception as e:
+            if progress_callback:
+                progress_callback(f"Error starting Ollama: {str(e)}")
+            return False
+
     def warm_up_model(self, model, progress_callback=None):
-        import time
         max_attempts = 10
         attempt = 0
         
@@ -39,14 +106,20 @@ class OllamaClient:
                         "model": model,
                         "messages": [{"role": "user", "content": "Hi"}],
                         "stream": False,
-                        "temperature": 0.1
+                        "temperature": 0.1,
+                        "think": False,
+                        "num_gpu": self.num_gpu
                     }
                 else:
                     payload = {
                         "model": model,
                         "prompt": "Hi",
                         "stream": False,
-                        "options": {"temperature": 0.1}
+                        "options": {
+                            "temperature": 0.1,
+                            "num_gpu": self.num_gpu
+                        },
+                        "think": False
                     }
                 
                 headers = {"Content-Type": "application/json"}
@@ -72,14 +145,37 @@ class OllamaClient:
 
     def translate_batch(self, text, target_lang, model, count):
         separator = "---BLOCK_SEP---"
-        system_prompt = (
-            f"You are a professional subtitle translator. Translate the following text blocks into {target_lang}. "
-            f"The input blocks are separated by '{separator}'. "
-            f"You MUST output the translated blocks separated by exactly the same separator '{separator}'. "
-            f"Do not include original text. Do not add explanations. "
-            f"IMPORTANT: Disable deep thinking. Do not generate <think> tags. Output translation directly. "
-            f"Return exactly {count} blocks. /no_think"
-        )
+        system_prompt = f"""You are a professional subtitle translator. Translate the following text blocks into {target_lang}.
+
+The input blocks are separated by '{separator}'.
+You MUST output the translated blocks in the EXACT format below:
+
+[1] first translation
+[2] second translation
+[3] third translation
+...
+
+Rules:
+- Each block MUST start with [number] on a new line
+- Do not include original text
+- Do not add explanations
+- Do not change the order
+- Return exactly {count} numbered blocks
+- Output translation directly, no thinking tags
+
+Example input:
+Hello world
+---BLOCK_SEP---
+How are you?
+---BLOCK_SEP---
+Good morning
+
+Example output:
+[1] 你好世界
+[2] 你好吗？
+[3] 早上好
+
+/no_think"""
         prompt = f"{text}"
         
         return self._make_request(model, system_prompt, prompt, is_batch=True)
@@ -98,7 +194,8 @@ class OllamaClient:
                     {"role": "user", "content": full_prompt}
                 ],
                 "stream": False,
-                "temperature": self.temperature
+                "temperature": self.temperature,
+                "num_gpu": self.num_gpu
             }
         else:
             payload = {
@@ -108,28 +205,67 @@ class OllamaClient:
                 "stream": False,
                 "options": {
                     "temperature": self.temperature,
-                    "num_ctx": 4096 if is_batch else 2048
-                }
+                    "num_ctx": 8192 if is_batch else 2048,
+                    "num_gpu": self.num_gpu
+                },
+                "think": False
             }
 
         headers = {"Content-Type": "application/json"}
         timeout = self.timeout * 2 if is_batch else self.timeout
         
-        try:
-            response = requests.post(self.api_url, json=payload, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            result = response.json()
-            
-            if "/v1/chat/completions" in self.api_url:
-                if 'choices' in result and len(result['choices']) > 0:
-                    translated_text = result['choices'][0]['message']['content'].strip()
+        max_retries = 2
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                self._last_request_time = time.time()
+                
+                response = self.session.post(
+                    self.api_url, 
+                    json=payload, 
+                    headers=headers, 
+                    timeout=timeout
+                )
+                response.raise_for_status()
+                result = response.json()
+                
+                if "/v1/chat/completions" in self.api_url:
+                    if 'choices' in result and len(result['choices']) > 0:
+                        translated_text = result['choices'][0]['message']['content'].strip()
+                    else:
+                        raise Exception(f"Invalid API response: {str(result)[:100]}")
                 else:
-                    raise Exception(f"Invalid API response: {str(result)[:100]}")
-            else:
-                translated_text = result.get("response", "").strip()
-            
-            # Remove <think> tags
-            translated_text = re.sub(r'<think>.*?</think>', '', translated_text, flags=re.DOTALL).strip()
-            return translated_text
-        except Exception as e:
-            raise Exception(f"API Request Error: {e}")
+                    translated_text = result.get("response", "").strip()
+                    if translated_text=="":
+                        print(f"Empty response, result: {result}")
+                        
+                
+                translated_text = re.sub(r'<think.*?>.*?</think\s*>', '', translated_text, flags=re.DOTALL).strip()
+                return translated_text
+                
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = attempt + 1
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = attempt + 1
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code in [429, 503]:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        time.sleep(wait_time)
+                        continue
+                raise
+            except Exception as e:
+                last_exception = e
+                break
+        
+        raise Exception(f"API Request Error after {max_retries} retries: {last_exception}")

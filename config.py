@@ -8,11 +8,12 @@ class ConfigManager:
             "target_language": "Chinese",
             "model": "qwen3:8b",
             "output_directory": "",
-            "batch_size": 30,
+            "batch_size": 20,
             "max_workers": 3,
             "ollama_api_url": "http://localhost:11434/api/generate",
             "timeout": 300,
-            "temperature": 0.1
+            "temperature": 0.1,
+            "num_gpu": 0
         }
         self.config = self.defaults.copy()
 
