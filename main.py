@@ -367,23 +367,34 @@ class SubtitleTranslatorApp(ctk.CTk):
             
             preview_len = 500
             preview = translated_batch_text[:preview_len] + "..." if len(translated_batch_text) > preview_len else translated_batch_text
-            # self.log(f"API response ({len(translated_batch_text)} chars): {preview.replace(chr(10), ' | ')}")
+            self.log(f"API response ({len(translated_batch_text)} chars): {preview.replace(chr(10), ' | ')}")
             
             parts = self._parse_batch_response(translated_batch_text, len(batch_blocks))
             
-            self.log(f"Received {len(parts)} parts from API for {len(batch_blocks)} blocks. translated_batch_text: {len(translated_batch_text)}")
+            self.log(f"Received {len(parts)} parts from API for {len(batch_blocks)} blocks.")
             
+            # Ensure EVERY block gets translated
             for i, b in enumerate(batch_blocks):
-                if i < len(parts) and parts[i]:
-                    b['translated_text'] = parts[i]
-                else:
-                    self.log(f"Batch count mismatch or empty part. Fallback to single for block {b['index']}")
-                    self.log(f"parts: {parts}, translated_batch_text: {translated_batch_text}, input_text: {input_text}")
+                should_fallback = False
+                
+                if i >= len(parts):
+                    self.log(f"Warning: Part {i} missing from API response for block {b['index']}. Fallback to single.")
+                    should_fallback = True
+                elif not parts[i] or len(parts[i].strip()) == 0:
+                    self.log(f"Warning: Part {i} is empty for block {b['index']}. Fallback to single.")
+                    should_fallback = True
+                elif parts[i] == b['text']:
+                    self.log(f"Warning: Part {i} unchanged for block {b['index']}. Fallback to single.")
+                    should_fallback = True
+                
+                if should_fallback:
                     try:
                         b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
                     except Exception as single_e:
-                        self.log(f"Single translation also failed for block {b['index']}: {single_e}")
+                        self.log(f"Single translation failed for block {b['index']}: {single_e}")
                         b['translated_text'] = b['text']
+                else:
+                    b['translated_text'] = parts[i]
                         
         except Exception as e:
             self.log(f"Batch translation failed: {e}. Falling back to single translation.")
@@ -397,6 +408,7 @@ class SubtitleTranslatorApp(ctk.CTk):
     def _parse_batch_response(self, response_text, expected_count):
         parts = []
         
+        # Strategy 1: Try to parse numbered format [1], [2], etc.
         pattern = r'^\[(\d+)\]\s*'
         lines = response_text.split('\n')
         
@@ -418,8 +430,10 @@ class SubtitleTranslatorApp(ctk.CTk):
             parts.append('\n'.join(current_text_lines).strip())
         
         if len(parts) == expected_count:
+            self.log(f"  Parse strategy 1 (numbered lines) succeeded: {len(parts)} parts")
             return parts
         
+        # Strategy 2: Try regex to find all numbered sections
         pattern2 = r'\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]|$)'
         matches = re.findall(pattern2, response_text, re.DOTALL)
         if matches:
@@ -427,23 +441,32 @@ class SubtitleTranslatorApp(ctk.CTk):
             parts = []
             for i in range(1, expected_count + 1):
                 parts.append(translation_dict.get(i, ""))
-            if len([p for p in parts if p]) > 0:
+            non_empty_count = len([p for p in parts if p])
+            if non_empty_count > 0:
+                self.log(f"  Parse strategy 2 (regex numbered) found {non_empty_count} non-empty parts")
                 return parts
         
+        # Strategy 3: Try separator-based parsing
         separator_pattern = r"---BLOCK_SEP---"
         if separator_pattern in response_text:
             parts = re.split(separator_pattern, response_text)
             parts = [p.strip() for p in parts if p.strip()]
             if len(parts) == expected_count:
+                self.log(f"  Parse strategy 3 (separator) succeeded: {len(parts)} parts")
                 return parts
         
+        # Strategy 4: Try line-by-line matching (one line per translation)
         lines_non_empty = [l.strip() for l in response_text.split('\n') if l.strip()]
         if len(lines_non_empty) == expected_count:
+            self.log(f"  Parse strategy 4 (line-by-line exact) succeeded: {len(parts)} parts")
             return lines_non_empty
         
         if len(lines_non_empty) >= expected_count:
+            self.log(f"  Parse strategy 5 (line-by-line truncated): got {len(lines_non_empty)}, taking first {expected_count}")
             return lines_non_empty[:expected_count]
         
+        # If all strategies fail, return empty list
+        self.log(f"  Parse failed: got {len(parts)} parts, expected {expected_count}")
         return parts
 
 if __name__ == "__main__":
