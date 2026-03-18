@@ -299,15 +299,16 @@ class SubtitleTranslatorApp(ctk.CTk):
             return
 
         batch_size = self.config.get("batch_size", 20)
-        valid_indices = [i for i, b in enumerate(parsed_blocks) if b.get("is_valid", True)]
+        # Translate ALL blocks, not just "valid" ones
+        all_indices = list(range(len(parsed_blocks)))
         
         max_workers = self.config.get("max_workers", 3)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_batch = {}
             
-            for i in range(0, len(valid_indices), batch_size):
-                batch_indices = valid_indices[i:i+batch_size]
+            for i in range(0, len(all_indices), batch_size):
+                batch_indices = all_indices[i:i+batch_size]
                 batch_blocks = [parsed_blocks[idx] for idx in batch_indices]
                 
                 # Prepare batch text
@@ -325,7 +326,7 @@ class SubtitleTranslatorApp(ctk.CTk):
                 future_to_batch[future] = (i, batch_blocks)
 
             # Collect results as they complete
-            total_batches = len(valid_indices)
+            total_batches = len(all_indices)
             processed_so_far = 0
 
             for future in concurrent.futures.as_completed(future_to_batch):
