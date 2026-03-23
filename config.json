@@ -1,0 +1,11 @@
+{
+    "target_language": "Chinese",
+    "model": "qwen3:8b",
+    "output_directory": "",
+    "batch_size": 10,
+    "max_workers": 2,
+    "ollama_api_url": "http://localhost:11434/api/generate",
+    "timeout": 90,
+    "temperature": 0.5,
+    "num_gpu": 999
+}
