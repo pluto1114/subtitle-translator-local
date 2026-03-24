@@ -36,6 +36,7 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.loading_animation_text = ""
         
         self.create_widgets()
+        self.refresh_models()
 
     def create_widgets(self):
         # Main Container
@@ -73,8 +74,11 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.label_model = ctk.CTkLabel(self.frame_controls, text="Ollama Model:")
         self.label_model.grid(row=3, column=0, padx=10, pady=10, sticky="w")
 
-        self.entry_model = ctk.CTkEntry(self.frame_controls, textvariable=self.model_name)
-        self.entry_model.grid(row=3, column=1, padx=10, pady=10, sticky="ew")
+        self.option_model = ctk.CTkOptionMenu(self.frame_controls, variable=self.model_name, values=[])
+        self.option_model.grid(row=3, column=1, padx=10, pady=10, sticky="ew")
+        
+        self.btn_refresh_models = ctk.CTkButton(self.frame_controls, text="⟳", width=30, command=self.refresh_models)
+        self.btn_refresh_models.grid(row=3, column=2, padx=5, pady=10, sticky="w")
 
         # Output Directory
         self.label_output = ctk.CTkLabel(self.frame_controls, text="Output Folder:")
@@ -106,6 +110,34 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.textbox_log.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
         self.textbox_log.configure(state="disabled")
 
+    def refresh_models(self):
+        """刷新已安装的模型列表"""
+        threading.Thread(target=self._load_models_thread, daemon=True).start()
+    
+    def _load_models_thread(self):
+        """后台线程加载模型列表"""
+        temp_client = OllamaClient(
+            self.config["ollama_api_url"], 
+            self.config["timeout"],
+            self.config["temperature"],
+            self.config.get("num_gpu", 0)
+        )
+        models = temp_client.list_models()
+        
+        self.after(0, self._update_model_dropdown, models)
+    
+    def _update_model_dropdown(self, models):
+        """更新模型下拉列表"""
+        if models:
+            self.option_model.configure(values=models)
+            current_model = self.model_name.get()
+            if current_model not in models:
+                self.model_name.set(models[0])
+            self.log(f"Loaded {len(models)} models")
+        else:
+            self.option_model.configure(values=[self.model_name.get()])
+            self.log("Could not load models (Ollama may not be running)")
+    
     def select_files(self):
         filetypes = (("Subtitle files", "*.srt"), ("All files", "*.*"))
         filenames = filedialog.askopenfilenames(title="Select files", filetypes=filetypes)
@@ -292,118 +324,85 @@ class SubtitleTranslatorApp(ctk.CTk):
         self.log(f"Starting translation for: {os.path.basename(file_path)}")
         
         parsed_blocks = SRTProcessor.parse_srt(file_path)
-        total_blocks = len(parsed_blocks)
         
-        if total_blocks == 0:
+        # 筛选出所有有效的块
+        valid_blocks = [b for b in parsed_blocks if b.get('is_valid', True)]
+        total_valid = len(valid_blocks)
+        
+        if total_valid == 0:
             self.log(f"Warning: No valid SRT blocks found in {os.path.basename(file_path)}.")
             return
+        
+        self.log(f"Found {total_valid} valid blocks to translate")
 
         batch_size = self.config.get("batch_size", 20)
-        # Translate ALL blocks, not just "valid" ones
-        all_indices = list(range(len(parsed_blocks)))
-        
         max_workers = self.config.get("max_workers", 3)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_batch = {}
+        # 按批次处理有效块
+        for i in range(0, total_valid, batch_size):
+            batch = valid_blocks[i:i+batch_size]
+            self.log(f"Processing batch {i//batch_size + 1}/{(total_valid + batch_size - 1)//batch_size} ({len(batch)} blocks)")
             
-            for i in range(0, len(all_indices), batch_size):
-                batch_indices = all_indices[i:i+batch_size]
-                batch_blocks = [parsed_blocks[idx] for idx in batch_indices]
+            # 准备批量输入 - 使用编号格式，提高解析可靠性
+            input_text = ""
+            for j, b in enumerate(batch):
+                input_text += f"[{j+1}] {b['text']}\n"
+            
+            try:
+                # 调用批量翻译
+                translated_text = self.api_client.translate_batch(input_text, target_lang, model, len(batch))
+                self.log(f"  Received response ({len(translated_text)} chars)")
                 
-                # Prepare batch text
-                input_text = ""
-                separator = "---BLOCK_SEP---"
-                for i, b in enumerate(batch_blocks):
-                    clean_text = b['text'].strip()
-                    if len(clean_text) > 30:
-                        clean_text = clean_text[:30]
-                    input_text += f"{clean_text}"
-                    if i < len(batch_blocks) - 1:
-                        input_text += f"\n{separator}\n"
+                # 解析批量响应
+                parts = self._parse_batch_response(translated_text, len(batch))
+                self.log(f"  Parsed {len(parts)} parts")
                 
-                future = executor.submit(self.process_batch, input_text, target_lang, model, batch_blocks)
-                future_to_batch[future] = (i, batch_blocks)
+                # 逐个分配翻译结果或回退到单翻译
+                for j, b in enumerate(batch):
+                    if j < len(parts) and parts[j] and parts[j].strip() and parts[j] != b['text']:
+                        b['translated_text'] = parts[j].strip()
+                    else:
+                        self.log(f"  Block {b['index']} missing/bad in batch, translating individually")
+                        b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
+            
+            except Exception as e:
+                self.log(f"  Batch failed: {e}")
+                # 批量失败时，逐个翻译
+                for b in batch:
+                    try:
+                        b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
+                    except Exception as e2:
+                        self.log(f"  Single failed for {b['index']}: {e2}")
+                        b['translated_text'] = b['text']
+            
+            # 更新进度
+            self.update_progress(min(i + batch_size, total_valid), total_valid, os.path.basename(file_path))
 
-            # Collect results as they complete
-            total_batches = len(all_indices)
-            processed_so_far = 0
-
-            for future in concurrent.futures.as_completed(future_to_batch):
-                i, batch_blocks = future_to_batch[future]
+        # 最终 100% 验证和修复
+        self.log(f"Performing 100% final verification...")
+        for b in valid_blocks:
+            if 'translated_text' not in b or not b['translated_text'] or b['translated_text'] == b['text']:
+                self.log(f"  Final fix: Translating block {b['index']}")
                 try:
-                    future.result()
-                    processed_so_far += len(batch_blocks)
-                    file_name = os.path.basename(file_path)
-                    self.update_progress(processed_so_far, total_batches, file_name)
+                    b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
                 except Exception as e:
-                    self.log(f"Error processing batch in {os.path.basename(file_path)}: {e}")
+                    self.log(f"  Final fix failed: {e}")
+                    b['translated_text'] = b['text']
 
-        # Save new file
+        # 保存文件
         base_name = os.path.basename(file_path)
         base, ext = os.path.splitext(base_name)
+        filename = f"{base}{ext}" if use_original_name else f"{base}_translated_{target_lang}{ext}"
         
-        if use_original_name:
-            filename = f"{base}{ext}"
-        else:
-            filename = f"{base}_translated_{target_lang}{ext}"
-            
         if output_dir and os.path.isdir(output_dir):
             new_file_path = os.path.join(output_dir, filename)
         else:
-            # Default to same directory as source file
-            source_dir = os.path.dirname(file_path)
-            new_file_path = os.path.join(source_dir, filename)
+            new_file_path = os.path.join(os.path.dirname(file_path), filename)
         
         SRTProcessor.save_srt(new_file_path, parsed_blocks)
         self.log(f"Saved to: {new_file_path}")
 
-    def process_batch(self, input_text, target_lang, model, batch_blocks):
-        batch_start_idx = batch_blocks[0]['index'] if batch_blocks else "?"
-        self.log(f"  Translating batch starting at index {batch_start_idx} ({len(batch_blocks)} blocks)...")
-        
-        try:
-            translated_batch_text = self.api_client.translate_batch(input_text, target_lang, model, len(batch_blocks))
-            
-            preview_len = 500
-            preview = translated_batch_text[:preview_len] + "..." if len(translated_batch_text) > preview_len else translated_batch_text
-            self.log(f"API response ({len(translated_batch_text)} chars): {preview.replace(chr(10), ' | ')}")
-            
-            parts = self._parse_batch_response(translated_batch_text, len(batch_blocks))
-            
-            self.log(f"Received {len(parts)} parts from API for {len(batch_blocks)} blocks.")
-            
-            # Ensure EVERY block gets translated
-            for i, b in enumerate(batch_blocks):
-                should_fallback = False
-                
-                if i >= len(parts):
-                    self.log(f"Warning: Part {i} missing from API response for block {b['index']}. Fallback to single.")
-                    should_fallback = True
-                elif not parts[i] or len(parts[i].strip()) == 0:
-                    self.log(f"Warning: Part {i} is empty for block {b['index']}. Fallback to single.")
-                    should_fallback = True
-                elif parts[i] == b['text']:
-                    self.log(f"Warning: Part {i} unchanged for block {b['index']}. Fallback to single.")
-                    should_fallback = True
-                
-                if should_fallback:
-                    try:
-                        b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
-                    except Exception as single_e:
-                        self.log(f"Single translation failed for block {b['index']}: {single_e}")
-                        b['translated_text'] = b['text']
-                else:
-                    b['translated_text'] = parts[i]
-                        
-        except Exception as e:
-            self.log(f"Batch translation failed: {e}. Falling back to single translation.")
-            for b in batch_blocks:
-                try:
-                    b['translated_text'] = self.api_client.translate_single(b['text'], target_lang, model)
-                except Exception as single_e:
-                    self.log(f"Single translation failed for block {b['index']}: {single_e}")
-                    b['translated_text'] = b['text']
+
     
     def _parse_batch_response(self, response_text, expected_count):
         parts = []

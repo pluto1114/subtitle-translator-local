@@ -1,6 +1,6 @@
 {
     "target_language": "Chinese",
-    "model": "qwen3:8b",
+    "model": "qwen3.5:9b",
     "output_directory": "",
     "batch_size": 10,
     "max_workers": 2,

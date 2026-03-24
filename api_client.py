@@ -144,10 +144,8 @@ class OllamaClient:
         return False
 
     def translate_batch(self, text, target_lang, model, count):
-        separator = "---BLOCK_SEP---"
-        system_prompt = f"""You are a professional subtitle translator. Translate the following text blocks into {target_lang}.
+        system_prompt = f"""You are a professional subtitle translator. Translate the following numbered text blocks into {target_lang}.
 
-The input blocks are separated by '{separator}'.
 You MUST output the translated blocks in the EXACT format below:
 
 [1] first translation
@@ -157,33 +155,35 @@ You MUST output the translated blocks in the EXACT format below:
 
 Rules:
 - Each block MUST start with [number] on a new line
-- Do not include original text
-- Do not add explanations
-- Do not change the order
-- Return exactly {count} numbered blocks
+- Do NOT include the original input text in your output
+- Do NOT add explanations or extra content
+- Do NOT change the order of the blocks
+- Return exactly {count} numbered blocks in your response
 - Output translation directly, no thinking tags
-
-Example input:
-Hello world
----BLOCK_SEP---
-How are you?
----BLOCK_SEP---
-Good morning
-
-Example output:
-[1] 你好世界
-[2] 你好吗？
-[3] 早上好
 
 /no_think"""
         prompt = f"{text}"
         
         return self._make_request(model, system_prompt, prompt, is_batch=True)
 
-    def translate_single(self, text, target_lang, model):
+    def translate_single(self, text, target_lang, model, max_retries=3):
         system_prompt = f"You are a professional subtitle translator. Translate the following text to {target_lang}. Keep it concise and suitable for subtitles. Do not output anything else. Do not output <think> tags. Translate directly. /no_think"
         prompt = f"{text}"
-        return self._make_request(model, system_prompt, prompt, is_batch=False)
+        
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                result = self._make_request(model, system_prompt, prompt, is_batch=False)
+                if result and len(result.strip()) > 0:
+                    return result
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    time.sleep(attempt + 1)
+        
+        # If all retries failed, return original text
+        print(f"Failed to translate single after {max_retries} attempts: {last_exception}")
+        return text
 
     def _make_request(self, model, system_prompt, prompt, is_batch=False):
         if "/v1/chat/completions" in self.api_url:
@@ -269,3 +269,28 @@ Example output:
                 break
         
         raise Exception(f"API Request Error after {max_retries} retries: {last_exception}")
+
+    def list_models(self) -> list[str]:
+        """获取已安装的 Ollama 模型列表
+        
+        Returns:
+            list[str]: 模型名称列表，失败时返回空列表
+        """
+        try:
+            parsed_url = requests.utils.urlparse(self.api_url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            tags_url = f"{base_url}/api/tags"
+            
+            response = requests.get(tags_url, timeout=5)
+            response.raise_for_status()
+            
+            result = response.json()
+            models = []
+            if 'models' in result:
+                for model in result['models']:
+                    if 'name' in model:
+                        models.append(model['name'])
+            
+            return sorted(models)
+        except Exception:
+            return []
